@@ -6,7 +6,7 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const DOMAIN = process.env.BACKEND_URL || 'https://airtel-money-congo.onrender.com';
+const DOMAIN = process.env.BACKEND_URL || 'https://click-loans-congo-x50d.onrender.com';
 
 // ---------------- MEMORY STORES ----------------
 const approvedPins = {};
